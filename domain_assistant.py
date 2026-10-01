@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from dotenv import load_dotenv
-from openai import OpenAI, OpenAIError
+from openai import OpenAI, OpenAIError, RateLimitError
 
 load_dotenv(Path(__file__).resolve().with_name(".env"))
 
@@ -266,6 +266,61 @@ class OpenAIGenerator:
         return answer
 
 
+GEMINI_OPENAI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
+
+
+class GeminiGenerator:
+    """Gemini through its OpenAI-compatible Chat Completions endpoint."""
+
+    def __init__(self, max_output_tokens: int = 300) -> None:
+        api_key = os.getenv("GEMINI_API_KEY", "").strip()
+        self.model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
+        # Thinking tokens share the output budget; "none" keeps the 300-token cap
+        # comparable with the OpenAI baseline. Leave empty for models that require thinking.
+        self.reasoning_effort = os.getenv("GEMINI_REASONING_EFFORT", "none").strip()
+        if not api_key:
+            raise RuntimeError("GEMINI_API_KEY is missing from .env")
+        self.client = OpenAI(api_key=api_key, base_url=GEMINI_OPENAI_BASE_URL)
+        self.max_output_tokens = max_output_tokens
+
+    def generate(self, prompt: str) -> str:
+        extra: dict[str, Any] = {}
+        if self.reasoning_effort:
+            extra["reasoning_effort"] = self.reasoning_effort
+        # Free-tier keys hit per-minute limits; back off instead of aborting the run.
+        delays = (15, 30, 60, 60, 60)
+        for attempt in range(len(delays) + 1):
+            try:
+                response = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0,
+                    max_tokens=self.max_output_tokens,
+                    **extra,
+                )
+                break
+            except RateLimitError as exc:
+                # A daily quota will not recover within the run; fail fast.
+                if attempt == len(delays) or "PerDay" in str(exc):
+                    raise
+                print(f"  rate limited; retrying in {delays[attempt]}s", flush=True)
+                time.sleep(delays[attempt])
+        answer = (response.choices[0].message.content or "").strip()
+        if not answer:
+            raise RuntimeError("Gemini returned an empty answer")
+        return answer
+
+
+def default_generator() -> TextGenerator:
+    """Pick the generator from LLM_PROVIDER in .env (default: openai)."""
+    provider = os.getenv("LLM_PROVIDER", "openai").strip().lower()
+    if provider == "gemini":
+        return GeminiGenerator()
+    if provider == "openai":
+        return OpenAIGenerator()
+    raise RuntimeError(f"Unsupported LLM_PROVIDER: {provider!r} (use openai or gemini)")
+
+
 @dataclass(frozen=True)
 class DomainResponse:
     question: str
@@ -299,7 +354,7 @@ class DomainAssistant:
         return cls(
             corpus_id,
             BM25Retriever(chunks),
-            generator if generator is not None else OpenAIGenerator(),
+            generator if generator is not None else default_generator(),
             top_k,
         )
 
